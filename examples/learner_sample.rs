@@ -1,10 +1,11 @@
 extern crate libpaxos;
 extern crate libc;
+extern crate futures;
 
 use libc::*;
+use futures::*;
 
 use std::path::Path;
-use std::thread;
 use std::slice;
 use std::ffi::CStr;
 
@@ -17,15 +18,14 @@ struct ClientValue {
 }
 
 // Learner printing decisions from libpaxos sample client.
-// Learner stops after 10 seconds.
 pub fn sample_client_learner() {
     let config = Path::new("paxos.conf");
-    let (decisions, lh) = libpaxos::start_learner(config);
-    thread::spawn(move || {
-        thread::sleep_ms(10000);
-        println!("sigint to learner...");
-        lh.stop().unwrap();
-    });
+    let (decisions, _lh) = libpaxos::start_learner(config);
+    // std::thread::spawn(move || {
+    //     thread::sleep_ms(10000);
+    //     println!("sigint to learner...");
+    //     lh.stop().unwrap();
+    // });
 
     let mut next_decision = decisions.into_future();
     while let Ok((Some(decision), decisions)) = next_decision.wait() {
