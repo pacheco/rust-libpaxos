@@ -5,13 +5,18 @@ use std::io::Write;
 use std::ffi::CString;
 use std::ffi::CStr;
 use std::slice;
+use std::thread;
+use std::sync::mpsc;
 
+use libc::pthread_self;
+use libc::pthread_kill;
 use libc::timeval;
 use libc::c_int;
 use libc::c_char;
 use libc::c_void;
 use libc::c_uint;
 use libc::size_t;
+use libc::SIGINT;
 
 // C interfacing
 
@@ -41,14 +46,11 @@ struct Callback<F, A> {
     arg: A,
 }
 
-extern "C" fn deliver_cb<F, A>(iid: c_uint,
-                               value: *const c_char,
-                               len: size_t,
-                               arg: *mut c_void)
+extern "C" fn deliver_cb<F, A>(iid: c_uint, value: *const c_char, len: size_t, arg: *mut c_void)
     where F: Fn(&mut A, u64, &[u8])
 {
     let bytes = unsafe { slice::from_raw_parts(value as *mut u8, len) };
-    let callback = unsafe { &mut* (arg as *mut Callback<F,A>) };
+    let callback = unsafe { &mut *(arg as *mut Callback<F, A>) };
     let f = &callback.f;
     let arg = &mut callback.arg;
     f(arg, iid as u64, bytes);
@@ -62,9 +64,9 @@ pub fn run_learner<F, A>(config: &Path, deliver_ctx: A, deliver_fn: F)
         f: deliver_fn,
         arg: deliver_ctx,
     };
-    let arg_ptr = &mut arg as *mut Callback<F,A> as *mut c_void;
+    let arg_ptr = &mut arg as *mut Callback<F, A> as *mut c_void;
     unsafe {
-        start_learner(c_cfg.as_ptr(), deliver_cb::<F,A>, arg_ptr);
+        start_learner(c_cfg.as_ptr(), deliver_cb::<F, A>, arg_ptr);
     }
 }
 
@@ -78,7 +80,7 @@ struct ClientValue {
     client_id: c_int,
     t: timeval,
     size: size_t,
-    value: [u8;0],
+    value: [u8; 0],
 }
 
 pub fn test_serialize() {
@@ -93,12 +95,27 @@ pub fn test_serialize() {
 
 pub fn test() {
     let config = Path::new("paxos.conf");
-    run_learner(&config, 0, |ctx, iid, bytes| {
-        let cval = unsafe { &*(bytes.as_ptr() as *const ClientValue) };
-        let bytes = unsafe { slice::from_raw_parts(cval.value.as_ptr(), cval.size) };
-        let c_str = unsafe { CStr::from_bytes_with_nul_unchecked(bytes) };
-        println!("{:?} {:?} {:?} {:?}", ctx, iid, cval.client_id, c_str);
+    let (send,recv) = mpsc::channel();
+    // learner
+    let t = thread::spawn(move || {
+        send.send(unsafe { pthread_self() }).unwrap();
+        run_learner(&config, 0, |ctx, iid, bytes| {
+            let cval = unsafe { &*(bytes.as_ptr() as *const ClientValue) };
+            let bytes = unsafe { slice::from_raw_parts(cval.value.as_ptr(), cval.size) };
+            let c_str = unsafe { CStr::from_bytes_with_nul_unchecked(bytes) };
+            println!("{:?} {:?} {:?} {:?}", ctx, iid, cval.client_id, c_str);
+        });
     });
+    let tid = recv.recv().unwrap();
+    // killer
+    thread::spawn(move || {
+        thread::sleep_ms(2000);
+        println!("sigint to learner...");
+        unsafe { pthread_kill(tid, SIGINT); }
+    });
+
+    t.join().unwrap();
+    println!("learner done!");
 }
 
 #[cfg(test)]
