@@ -1,11 +1,15 @@
 extern crate libc;
 extern crate futures;
 
+use std::fs::File;
 use std::any::Any;
 use std::path::Path;
 use std::io::Write;
+use std::io::BufReader;
+use std::io::BufRead;
 use std::ffi::CString;
-use std::ffi::CStr;
+use std::net::TcpStream;
+use std::net::SocketAddr;
 use std::slice;
 use std::thread;
 
@@ -18,8 +22,6 @@ use futures::sync::mpsc;
 use libc::pthread_t;
 use libc::pthread_self;
 use libc::pthread_kill;
-use libc::timeval;
-use libc::c_int;
 use libc::c_char;
 use libc::c_void;
 use libc::c_uint;
@@ -90,23 +92,29 @@ fn run_learner<F, A>(config: &Path, deliver_ctx: A, deliver_fn: F)
 // High-level interface
 // ----------------------
 
+// used to stop its learner
 pub struct LearnerHandle {
     th: thread::JoinHandle<()>,
     tid: pthread_t,
 }
 
 impl LearnerHandle {
+    // Stop its learner
     pub fn stop(self) -> Result<(), Box<Any + Send + 'static>> {
-        unsafe { pthread_kill(self.tid, SIGINT); }
+        unsafe {
+            pthread_kill(self.tid, SIGINT);
+        }
         self.th.join()
     }
 }
 
+// The stream of Paxos decisions
 pub struct DecisionStream {
     inner: mpsc::UnboundedReceiver<Decision>,
 }
 
 #[derive(Debug)]
+// Decided paxos slot
 pub struct Decision {
     pub iid: u64,
     pub value: Vec<u8>,
@@ -121,6 +129,8 @@ impl Stream for DecisionStream {
     }
 }
 
+// Start a learner. It will run in its own thread and decisions are sent to the returned stream.
+// The handle can be used to stop the learner.
 pub fn start_learner(config: &Path) -> (DecisionStream, LearnerHandle) {
     let (send, recv) = oneshot::channel();
     // learner evloop runs in a background thread. To kill it, we
@@ -132,60 +142,70 @@ pub fn start_learner(config: &Path) -> (DecisionStream, LearnerHandle) {
         send.send(unsafe { pthread_self() }).unwrap();
         run_learner(&config, dsend, |dsend, iid, bytes| {
             dsend.send(Decision {
-                iid: iid,
-                value: Vec::from(bytes),
-            }).unwrap();
+                     iid: iid,
+                     value: Vec::from(bytes),
+                 })
+                 .unwrap();
         });
     });
     let tid = recv.wait().unwrap();
-    (DecisionStream {
-        inner: drecv,
-    },
-     LearnerHandle {
-         th: th,
-         tid: tid,
-     })
+    (DecisionStream { inner: drecv }, LearnerHandle { th: th, tid: tid })
 }
 
-// Ad-hoc tests
-
-pub fn test_serialize() {
-    let data = CString::new("foobar").unwrap();
-    let len = data.as_bytes().len();
-    let ptr = data.as_ptr();
-    let mut vec = vec![];
-    let vec_ptr: *mut Vec<u8> = &mut vec;
-    unsafe { wrapper::serialize_submit(ptr, len, writer_write::<Vec<u8>>, vec_ptr as *mut c_void) };
-    println!("{:?}", vec);
+// Connection to a proposer.
+pub struct ProposerConnection {
+    pub pid: i64,
+    conn: TcpStream,
 }
 
-#[repr(C)]
-struct ClientValue {
-    client_id: c_int,
-    t: timeval,
-    size: size_t,
-    value: [u8; 0],
-}
-
-// Learner printing decisions from libpaxos sample client
-pub fn sample_client_learner() {
-    let config = Path::new("paxos.conf");
-    let (decisions, lh) = start_learner(config);
-    thread::spawn(move || {
-        thread::sleep_ms(2000);
-        println!("sigint to learner...");
-        lh.stop().unwrap();
-    });
-
-    let mut next_decision = decisions.into_future();
-    while let Ok((Some(decision), decisions)) = next_decision.wait() {
-        let cval = unsafe { &*(decision.value.as_ptr() as *const ClientValue) };
-        let bytes = unsafe { slice::from_raw_parts(cval.value.as_ptr(), cval.size) };
-        let c_str = unsafe { CStr::from_bytes_with_nul_unchecked(bytes) };
-        println!("iid: {:?} cid: {:?} val: {:?}", decision.iid, cval.client_id, c_str);
-        next_decision = decisions.into_future();
+impl ProposerConnection {
+    pub fn submit<'a, V: Into<&'a [u8]>>(&mut self, value: V) -> Result<(), std::io::Error> {
+        let bytes = value.into();
+        let len = bytes.len();
+        let ptr = bytes.as_ptr() as *const c_char;
+        let mut vec = vec![];
+        let vec_ptr: *mut Vec<u8> = &mut vec;
+        unsafe { wrapper::serialize_submit(ptr, len, writer_write::<Vec<u8>>, vec_ptr as *mut c_void) };
+        self.conn.write_all(&vec)
     }
-    println!("learner done!");
+}
+
+fn proposer_address(config: &Path, pid: i64) -> Result<SocketAddr, std::io::Error> {
+    let f = File::open(config)?;
+    let bf = BufReader::new(f);
+    for line in bf.lines() {
+        match line {
+            Ok(line) => {
+                let line = line.trim();
+                if line.starts_with("replica") || line.starts_with("proposer") {
+                    let parts: Vec<_> = line.split_whitespace().collect();
+                    // FIXME: crashes on malformed config
+                    let id: i64 = parts[1].parse().unwrap();
+                    if id == pid {
+                        let mut addrstr = String::new();
+                        addrstr = addrstr + parts[2] + ":" + parts[3];
+                        return Ok(addrstr.parse().unwrap())
+                    }
+                }
+            }
+            Err(err) => return Err(err)
+        }
+    }
+    // FIXME: panics if proposer id not found
+    panic!("proposer id not found on config file")
+}
+
+// Connect to the proposer with the given Id. The returned
+// ProposerConnection can be used to submit commands to Paxos.
+pub fn connect_to_proposer(config: &Path, pid: i64) -> ProposerConnection {
+    // FIXME: unwraps
+    let addr = proposer_address(config, pid).unwrap();
+    let conn = TcpStream::connect(addr).unwrap();
+    conn.set_nodelay(true).unwrap();
+    ProposerConnection {
+        pid: pid,
+        conn: conn,
+    }
 }
 
 #[cfg(test)]
