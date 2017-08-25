@@ -1,23 +1,28 @@
 extern crate libc;
 extern crate futures;
+#[macro_use]
+extern crate error_chain;
+extern crate tokio_core;
+extern crate tokio_io;
 
 use std::fs::File;
-use std::any::Any;
 use std::path::Path;
 use std::io::Write;
 use std::io::BufReader;
 use std::io::BufRead;
 use std::ffi::CString;
-use std::net::TcpStream;
 use std::net::SocketAddr;
 use std::slice;
 use std::thread;
+use std::rc::Rc;
+use std::cell::RefCell;
 
-use futures::Future;
-use futures::Stream;
-use futures::Poll;
+use futures::*;
 use futures::sync::oneshot;
 use futures::sync::mpsc;
+
+use tokio_core::reactor::Handle;
+use tokio_core::net::TcpStream;
 
 use libc::pthread_t;
 use libc::pthread_self;
@@ -27,6 +32,26 @@ use libc::c_void;
 use libc::c_uint;
 use libc::size_t;
 use libc::SIGINT;
+
+pub use errors::*;
+
+mod errors {
+    use std;
+    use futures;
+
+    error_chain! {
+        errors {
+            ProposerClientError(value: Vec<u8>) {
+            }
+        }
+
+        foreign_links {
+            Io(std::io::Error);
+            FutureCanceled(futures::Canceled);
+        }
+    }
+}
+
 
 // C wrapper
 // ---------------------
@@ -89,11 +114,11 @@ pub struct LearnerHandle {
 
 impl LearnerHandle {
     // Stop its learner
-    pub fn stop(self) -> Result<(), Box<Any + Send + 'static>> {
+    pub fn stop(self) -> Result<()> {
         unsafe {
             pthread_kill(self.tid, SIGINT);
         }
-        self.th.join()
+        self.th.join().map_err(|_| "error joining thread".into())
     }
 }
 
@@ -131,16 +156,17 @@ pub fn start_learner_as_stream(config: &Path) -> (DecisionStream, LearnerHandle)
         send.send(unsafe { pthread_self() }).unwrap();
         run_learner(&config, |iid, bytes| {
             dsend.unbounded_send(Decision {
-                iid: iid,
-                value: Vec::from(bytes),
-            })
-                .unwrap();
+                     iid: iid,
+                     value: Vec::from(bytes),
+                 })
+                 .unwrap();
         });
     });
     let tid = recv.wait().unwrap();
     (DecisionStream { inner: drecv }, LearnerHandle { th: th, tid: tid })
 }
 
+// Start a learner. It will run in its own thread and decision_fn will be called for each decision.
 pub fn start_learner<F>(config: &Path, decision_fn: F) -> LearnerHandle
     where F: FnMut(u64, &[u8]) + Send + 'static
 {
@@ -154,62 +180,97 @@ pub fn start_learner<F>(config: &Path, decision_fn: F) -> LearnerHandle
     LearnerHandle { th: th, tid: tid }
 }
 
+
 // Connection to a proposer.
-pub struct ProposerConnection {
+pub struct ProposerClient {
     pub pid: i64,
-    conn: TcpStream,
+    submit_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
-impl ProposerConnection {
-    pub fn submit<'a, V: Into<&'a [u8]>>(&mut self, value: V) -> Result<(), std::io::Error> {
-        let bytes = value.into();
-        let len = bytes.len();
-        let ptr = bytes.as_ptr() as *const c_char;
+
+impl ProposerClient {
+    pub fn connect(config: &Path,
+                   pid: i64,
+                   handle: &Handle)
+                   -> Box<Future<Item = Self, Error = Error>> {
+        let (tx, rx) = mpsc::unbounded::<Vec<u8>>();
+        let (conntx, connrx) = oneshot::channel::<Result<()>>();
+
+        // background task connecting to proposer and submitting values
+        let addr = proposer_address(config, pid);
+        let connect = {
+            let handle = handle.clone();
+            future::done(addr).and_then(move |addr| {
+                TcpStream::connect(&addr, &handle).map_err(|err| err.into())
+            })
+        };
+
+        let conntx = Rc::new(RefCell::new(Some(conntx)));
+        let conntx2 = conntx.clone();
+        let submit_loop =
+            connect.or_else(move |err| {
+                       println!("could not connect to proposer {}", pid);
+                       conntx.borrow_mut().take().unwrap().send(Err(err)).ok(); // ignore
+                       Err(())
+                   })
+                   .and_then(move |sock| {
+                       conntx2.borrow_mut().take().unwrap().send(Ok(())).ok(); // ignore
+                       println!("connected to proposer {}", pid);
+                       rx.fold(sock, |sock, val| {
+                           println!("submiting a value");
+                           tokio_io::io::write_all(sock, val)
+                               .map_err(|_| ())
+                               .map(|(sock, _)| sock)
+                       })
+                   });
+        handle.spawn(submit_loop.map(|_| ()));
+
+        Box::new(connrx.map_err(|err| err.into()).and_then(move |c| {
+            if let Err(e) = c {
+                Err(e)
+            } else {
+                Ok(ProposerClient {
+                    pid: pid,
+                    submit_tx: tx,
+                })
+            }
+        }))
+    }
+
+    pub fn submit<V: AsRef<[u8]>>(&self, value: V) -> Result<()> {
+        let len = value.as_ref().len();
+        let ptr = value.as_ref().as_ptr() as *const c_char;
         let mut vec = vec![];
         let vec_ptr: *mut Vec<u8> = &mut vec;
         unsafe {
             wrapper::serialize_submit(ptr, len, writer_write::<Vec<u8>>, vec_ptr as *mut c_void)
         };
-        self.conn.write_all(&vec)
+        self.submit_tx
+            .unbounded_send(vec)
+            .map_err(|err| ErrorKind::ProposerClientError(err.into_inner()).into())
     }
 }
 
-fn proposer_address(config: &Path, pid: i64) -> Result<SocketAddr, std::io::Error> {
-    let f = File::open(config)?;;;
+
+fn proposer_address(config: &Path, pid: i64) -> Result<SocketAddr> {
+    let f = File::open(config)?;;;;;;;;;;
     let bf = BufReader::new(f);
     for line in bf.lines() {
-        match line {
-            Ok(line) => {
-                let line = line.trim();
-                if line.starts_with("replica") || line.starts_with("proposer") {
-                    let parts: Vec<_> = line.split_whitespace().collect();
-                    // FIXME: crashes on malformed config
-                    let id: i64 = parts[1].parse().unwrap();
-                    if id == pid {
-                        let mut addrstr = String::new();
-                        addrstr = addrstr + parts[2] + ":" + parts[3];
-                        return Ok(addrstr.parse().unwrap());
-                    }
-                }
+        let line = line?;;;;;;;
+        let line = line.trim();
+        if line.starts_with("replica") || line.starts_with("proposer") {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            // FIXME: crashes on malformed config
+            let id: i64 = parts[1].parse().unwrap();
+            if id == pid {
+                let mut addrstr = String::new();
+                addrstr = addrstr + parts[2] + ":" + parts[3];
+                return Ok(addrstr.parse().unwrap());
             }
-            Err(err) => return Err(err),
         }
     }
     // FIXME: panics if proposer id not found
     panic!("proposer id not found on config file")
-}
-
-// Connect to the proposer with the given Id. The returned
-// ProposerConnection can be used to submit commands to Paxos.
-pub fn connect_to_proposer(config: &Path, pid: i64) -> ProposerConnection {
-    // FIXME: unwraps
-    let addr = proposer_address(config, pid).unwrap();
-    let conn = TcpStream::connect(addr).unwrap();
-    conn.set_nodelay(true).unwrap();
-    ProposerConnection {
-        pid: pid,
-        conn: conn,
-    }
 }
 
 #[cfg(test)]
