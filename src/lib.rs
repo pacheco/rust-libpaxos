@@ -141,7 +141,7 @@ pub fn start_learner(config: &Path) -> (DecisionStream, LearnerHandle) {
     let th = thread::spawn(move || {
         send.send(unsafe { pthread_self() }).unwrap();
         run_learner(&config, dsend, |dsend, iid, bytes| {
-            dsend.send(Decision {
+            dsend.unbounded_send(Decision {
                      iid: iid,
                      value: Vec::from(bytes),
                  })
