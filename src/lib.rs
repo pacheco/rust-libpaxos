@@ -60,32 +60,21 @@ extern "C" fn writer_write<T: Write>(write: *mut c_void, value: *const c_char, l
 // Rust side wrapper
 // -----------------------
 
-struct Callback<F, A> {
-    f: F,
-    arg: A,
-}
-
-extern "C" fn deliver_cb<F, A>(iid: c_uint, value: *const c_char, len: size_t, arg: *mut c_void)
-    where F: Fn(&mut A, u64, &[u8])
+extern "C" fn deliver_cb<F>(iid: c_uint, value: *const c_char, len: size_t, arg: *mut c_void)
+    where F: FnMut(u64, &[u8])
 {
     let bytes = unsafe { slice::from_raw_parts(value as *mut u8, len) };
-    let callback = unsafe { &mut *(arg as *mut Callback<F, A>) };
-    let f = &callback.f;
-    let arg = &mut callback.arg;
-    f(arg, iid as u64, bytes);
+    let callback = unsafe { &mut *(arg as *mut F) };
+    callback(iid as u64, bytes);
 }
 
-fn run_learner<F, A>(config: &Path, deliver_ctx: A, deliver_fn: F)
-    where F: Fn(&mut A, u64, &[u8])
+fn run_learner<F>(config: &Path, mut deliver_fn: F)
+    where F: FnMut(u64, &[u8])
 {
     let c_cfg = CString::new(config.to_str().unwrap()).unwrap();
-    let mut arg = Callback {
-        f: deliver_fn,
-        arg: deliver_ctx,
-    };
-    let arg_ptr = &mut arg as *mut Callback<F, A> as *mut c_void;
+    let cb_ptr = &mut deliver_fn as *mut F as *mut c_void;
     unsafe {
-        wrapper::start_learner(c_cfg.as_ptr(), deliver_cb::<F, A>, arg_ptr);
+        wrapper::start_learner(c_cfg.as_ptr(), deliver_cb::<F>, cb_ptr);
     }
 }
 
@@ -131,25 +120,38 @@ impl Stream for DecisionStream {
 
 // Start a learner. It will run in its own thread and decisions are sent to the returned stream.
 // The handle can be used to stop the learner.
-pub fn start_learner(config: &Path) -> (DecisionStream, LearnerHandle) {
-    let (send, recv) = oneshot::channel();
+pub fn start_learner_as_stream(config: &Path) -> (DecisionStream, LearnerHandle) {
     // learner evloop runs in a background thread. To kill it, we
     // issue a pthread_kill, the C wrapper handles the SIGKILL to
     // shutdown the evloop.
     let config = config.to_owned();
+    let (send, recv) = oneshot::channel();
     let (dsend, drecv) = mpsc::unbounded();
     let th = thread::spawn(move || {
         send.send(unsafe { pthread_self() }).unwrap();
-        run_learner(&config, dsend, |dsend, iid, bytes| {
+        run_learner(&config, |iid, bytes| {
             dsend.unbounded_send(Decision {
-                     iid: iid,
-                     value: Vec::from(bytes),
-                 })
-                 .unwrap();
+                iid: iid,
+                value: Vec::from(bytes),
+            })
+                .unwrap();
         });
     });
     let tid = recv.wait().unwrap();
     (DecisionStream { inner: drecv }, LearnerHandle { th: th, tid: tid })
+}
+
+pub fn start_learner<F>(config: &Path, decision_fn: F) -> LearnerHandle
+    where F: FnMut(u64, &[u8]) + Send + 'static
+{
+    let config = config.to_owned();
+    let (send, recv) = oneshot::channel();
+    let th = thread::spawn(move || {
+        send.send(unsafe { pthread_self() }).unwrap();
+        run_learner(&config, decision_fn);
+    });
+    let tid = recv.wait().unwrap();
+    LearnerHandle { th: th, tid: tid }
 }
 
 // Connection to a proposer.
@@ -165,13 +167,15 @@ impl ProposerConnection {
         let ptr = bytes.as_ptr() as *const c_char;
         let mut vec = vec![];
         let vec_ptr: *mut Vec<u8> = &mut vec;
-        unsafe { wrapper::serialize_submit(ptr, len, writer_write::<Vec<u8>>, vec_ptr as *mut c_void) };
+        unsafe {
+            wrapper::serialize_submit(ptr, len, writer_write::<Vec<u8>>, vec_ptr as *mut c_void)
+        };
         self.conn.write_all(&vec)
     }
 }
 
 fn proposer_address(config: &Path, pid: i64) -> Result<SocketAddr, std::io::Error> {
-    let f = File::open(config)?;
+    let f = File::open(config)?;;;
     let bf = BufReader::new(f);
     for line in bf.lines() {
         match line {
@@ -184,11 +188,11 @@ fn proposer_address(config: &Path, pid: i64) -> Result<SocketAddr, std::io::Erro
                     if id == pid {
                         let mut addrstr = String::new();
                         addrstr = addrstr + parts[2] + ":" + parts[3];
-                        return Ok(addrstr.parse().unwrap())
+                        return Ok(addrstr.parse().unwrap());
                     }
                 }
             }
-            Err(err) => return Err(err)
+            Err(err) => return Err(err),
         }
     }
     // FIXME: panics if proposer id not found
