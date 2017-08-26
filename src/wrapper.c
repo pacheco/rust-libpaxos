@@ -9,7 +9,7 @@ typedef int (*writefn)(void* arg, const char* buf, size_t len);
 
 static void msgpack_pack_string(msgpack_packer* p, const char* buffer, int len);
 
-void start_learner(const char* config, deliver_function f, void* arg)
+void start_learner(const char* config, deliver_function f, void* arg, unsigned starting_iid)
 {
 	struct evlearner* lea;
 	struct event_base* base;
@@ -20,6 +20,8 @@ void start_learner(const char* config, deliver_function f, void* arg)
 		printf("Could not start the learner!\n");
 		exit(1);
 	}
+
+    evlearner_set_instance_id(lea, starting_iid);
 
 	signal(SIGPIPE, SIG_IGN);
 	event_base_dispatch(base);

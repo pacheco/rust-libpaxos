@@ -68,7 +68,7 @@ mod wrapper {
     #[link(name = "evpaxos")]
     #[link(name = "event")]
     extern "C" {
-        pub fn start_learner(config: *const c_char, cb: DeliverFn, arg: *mut c_void);
+        pub fn start_learner(config: *const c_char, cb: DeliverFn, arg: *mut c_void, starting_iid: c_uint);
         pub fn serialize_submit(value: *const c_char,
                                 len: size_t,
                                 write_fn: SerializeWriteFn,
@@ -93,13 +93,13 @@ extern "C" fn deliver_cb<F>(iid: c_uint, value: *const c_char, len: size_t, arg:
     callback(iid as u64, bytes);
 }
 
-fn run_learner<F>(config: &Path, mut deliver_fn: F)
+fn run_learner<F>(config: &Path, starting_iid: u64, mut deliver_fn: F)
     where F: FnMut(u64, &[u8])
 {
     let c_cfg = CString::new(config.to_str().unwrap()).unwrap();
     let cb_ptr = &mut deliver_fn as *mut F as *mut c_void;
     unsafe {
-        wrapper::start_learner(c_cfg.as_ptr(), deliver_cb::<F>, cb_ptr);
+        wrapper::start_learner(c_cfg.as_ptr(), deliver_cb::<F>, cb_ptr, starting_iid as c_uint);
     }
 }
 
@@ -145,7 +145,7 @@ impl Stream for DecisionStream {
 
 // Start a learner. It will run in its own thread and decisions are sent to the returned stream.
 // The handle can be used to stop the learner.
-pub fn start_learner_as_stream(config: &Path) -> (DecisionStream, LearnerHandle) {
+pub fn start_learner_as_stream(config: &Path, starting_iid: u64) -> (DecisionStream, LearnerHandle) {
     // learner evloop runs in a background thread. To kill it, we
     // issue a pthread_kill, the C wrapper handles the SIGKILL to
     // shutdown the evloop.
@@ -154,7 +154,7 @@ pub fn start_learner_as_stream(config: &Path) -> (DecisionStream, LearnerHandle)
     let (dsend, drecv) = mpsc::unbounded();
     let th = thread::spawn(move || {
         send.send(unsafe { pthread_self() }).unwrap();
-        run_learner(&config, |iid, bytes| {
+        run_learner(&config, starting_iid, |iid, bytes| {
             dsend.unbounded_send(Decision {
                      iid: iid,
                      value: Vec::from(bytes),
@@ -167,14 +167,14 @@ pub fn start_learner_as_stream(config: &Path) -> (DecisionStream, LearnerHandle)
 }
 
 // Start a learner. It will run in its own thread and decision_fn will be called for each decision.
-pub fn start_learner<F>(config: &Path, decision_fn: F) -> LearnerHandle
+pub fn start_learner<F>(config: &Path, starting_iid: u64, decision_fn: F) -> LearnerHandle
     where F: FnMut(u64, &[u8]) + Send + 'static
 {
     let config = config.to_owned();
     let (send, recv) = oneshot::channel();
     let th = thread::spawn(move || {
         send.send(unsafe { pthread_self() }).unwrap();
-        run_learner(&config, decision_fn);
+        run_learner(&config, starting_iid, decision_fn);
     });
     let tid = recv.wait().unwrap();
     LearnerHandle { th: th, tid: tid }
