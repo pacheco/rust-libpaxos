@@ -20,7 +20,7 @@ struct ClientValue {
 // Learner printing decisions from libpaxos sample client.
 pub fn sample_client_learner() {
     let config = Path::new("paxos.conf");
-    let (decisions, _lh) = libpaxos::start_learner_as_stream(config, 0);
+    let (decisions, _lh) = libpaxos::learner::decision_stream(config, 0);
     // std::thread::spawn(move || {
     //     thread::sleep_ms(10000);
     //     println!("sigint to learner...");

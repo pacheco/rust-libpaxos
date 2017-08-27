@@ -7,7 +7,7 @@ use futures::*;
 
 fn main() {
     let config = Path::new("paxos.conf");
-    let (decisions, _lh) = libpaxos::start_learner_as_stream(config, 0);
+    let (decisions, _lh) = libpaxos::learner::decision_stream(config, 0);
 
     let mut next_decision = decisions.into_future();
     while let Ok((Some(decision), decisions)) = next_decision.wait() {
