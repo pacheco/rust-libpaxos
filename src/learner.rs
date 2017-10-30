@@ -1,5 +1,4 @@
-use ::wrapper;
-use ::Result;
+use ::*;
 
 use std::thread;
 use std::slice;
@@ -56,7 +55,7 @@ impl LearnerHandle {
         unsafe {
             pthread_kill(self.tid, SIGINT);
         }
-        self.th.join().map_err(|_| "error joining thread".into())
+        self.th.join().map_err(|_| other_err("error joining thread"))
     }
 }
 

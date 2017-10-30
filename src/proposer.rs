@@ -54,6 +54,11 @@ impl Future for Submitted {
     }
 }
 
+impl<V: AsRef<[u8]>> ProposerClient<V> {
+    pub fn submit(&self, value: V) -> Submitted {
+        self.call(value)
+    }
+}
 
 impl<V: AsRef<[u8]>> Service for ProposerClient<V> {
     type Request = V;

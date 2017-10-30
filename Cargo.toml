@@ -5,9 +5,8 @@ authors = ["Leandro Pacheco <contact@leandropacheco.com>"]
 
 [dependencies]
 libc = "0.2"
-error-chain = "0.10"
 
-futures = "0.1.15"
+futures = "0.1"
 tokio-core = "0.1"
 tokio-io = "0.1"
 tokio-timer = "0.1"

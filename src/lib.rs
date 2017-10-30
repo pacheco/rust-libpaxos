@@ -1,7 +1,5 @@
 extern crate libc;
 extern crate futures;
-#[macro_use]
-extern crate error_chain;
 extern crate tokio_core;
 extern crate tokio_io;
 extern crate tokio_service;
@@ -21,16 +19,34 @@ mod errors {
     use std;
     use futures;
 
-    error_chain! {
-        errors {
-            ProposerClientError(value: Vec<u8>) {
-            }
-        }
+    pub type Result<T> = std::result::Result<T, Error>;
 
-        foreign_links {
-            Io(std::io::Error);
-            FutureCanceled(futures::Canceled);
+    pub enum Error {
+        Io(std::io::Error),
+        FutureCanceled(futures::Canceled),
+        Other(String),
+    }
+
+    impl From<std::io::Error> for Error {
+        fn from(other: std::io::Error) -> Self {
+            Error::Io(other)
         }
+    }
+
+    impl From<futures::Canceled> for Error {
+        fn from(other: futures::Canceled) -> Self {
+            Error::FutureCanceled(other)
+        }
+    }
+
+    impl From<String> for Error {
+        fn from(other: String) -> Self {
+            Error::Other(other)
+        }
+    }
+
+    pub fn other_err<E: std::fmt::Debug>(other: E) -> Error {
+        Error::Other(format!("{:?}", other))
     }
 }
 

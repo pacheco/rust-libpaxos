@@ -32,10 +32,10 @@ pub fn sample_client_learner() {
         let cval = unsafe { &*(decision.value.as_ptr() as *const ClientValue) };
         let bytes = unsafe { slice::from_raw_parts(cval.value.as_ptr(), cval.size) };
         let c_str = unsafe { CStr::from_bytes_with_nul_unchecked(bytes) };
-        println!("iid: {:?} cid: {:?} val: {:?}",
-                 decision.iid,
-                 cval.client_id,
-                 c_str);
+        // println!("iid: {:?} cid: {:?} val: {:?}",
+        //          decision.iid,
+        //          cval.client_id,
+        //          c_str);
         next_decision = decisions.into_future();
     }
     println!("learner done!");

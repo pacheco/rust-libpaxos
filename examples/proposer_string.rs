@@ -24,6 +24,7 @@ fn main() {
         "World",
         "Foobar",
     ]);
+    // let to_send = stream::repeat("Hello");
     let submit_stuff = connect.and_then(move |p| {
         to_send.for_each(move |s| {
             p.call(s)
